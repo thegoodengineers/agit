@@ -511,3 +511,113 @@ export function toAtif(events: AgitEvent[], meta: SessionMeta | null): Record<st
     },
   };
 }
+
+/**
+ * Render a session trajectory as a structured Markdown audit report.
+ * Formats metadata, usage totals, touched files, and the step timeline.
+ */
+export function toMarkdown(events: AgitEvent[], meta: SessionMeta | null): string {
+  const sessionId = meta?.sessionId ?? events[0]?.session ?? "unknown";
+  const runtime = firstOf(events, "session.start", "runtime") ?? meta?.adapter.name ?? "unknown";
+  const runtimeVersion = firstOf(events, "session.start", "runtimeVersion");
+  const headHash = meta?.headHash ?? events[events.length - 1]?.hash ?? "unknown";
+
+  const lines: string[] = [];
+  lines.push(`# Session Audit: ${sessionId}\n`);
+  lines.push(`- **Runtime**: ${runtime}${runtimeVersion ? ` (${runtimeVersion})` : ""}`);
+  lines.push(`- **Events**: ${events.length}`);
+  lines.push(`- **Head Hash**: \`${headHash}\``);
+  if (meta?.importedAt) {
+    lines.push(`- **Imported At**: ${meta.importedAt}`);
+  }
+  lines.push("");
+
+  let inputTokens = 0;
+  let outputTokens = 0;
+  const models = new Set<string>();
+  for (const e of events) {
+    if (e.type === "cost") {
+      const p = payload(e);
+      const u = usageOf(e);
+      inputTokens += u.inputTokens ?? u.input_tokens ?? 0;
+      outputTokens += u.outputTokens ?? u.output_tokens ?? 0;
+      if (typeof p.model === "string") models.add(p.model);
+    }
+  }
+
+  if (inputTokens > 0 || outputTokens > 0 || models.size > 0) {
+    lines.push("## Usage & Models\n");
+    if (models.size > 0) {
+      lines.push(`- **Models**: ${[...models].sort().join(", ")}`);
+    }
+    lines.push(`- **Input Tokens**: ${inputTokens.toLocaleString("en-US")}`);
+    lines.push(`- **Output Tokens**: ${outputTokens.toLocaleString("en-US")}`);
+    lines.push(`- **Total Tokens**: ${(inputTokens + outputTokens).toLocaleString("en-US")}\n`);
+  }
+
+  const files: { path: string; kind: string }[] = [];
+  for (const e of events) {
+    if (e.type === "file.diff") {
+      const p = payload(e);
+      const path = str(p.path);
+      const kind = str(p.kind) ?? "edit";
+      if (path && !files.some((f) => f.path === path)) {
+        files.push({ path, kind });
+      }
+    } else if (e.type === "file.delete") {
+      const p = payload(e);
+      const path = str(p.path);
+      if (path && !files.some((f) => f.path === path)) {
+        files.push({ path, kind: "delete" });
+      }
+    }
+  }
+
+  if (files.length > 0) {
+    lines.push("## Files Touched\n");
+    lines.push("| Action | Path |");
+    lines.push("|---|---|");
+    for (const f of files) {
+      lines.push(`| \`${f.kind}\` | \`${f.path}\` |`);
+    }
+    lines.push("");
+    lines.push(
+      "> Structured edits only. Files changed by shell commands leave no record (SPEC §5.7), " +
+        "so this is a floor on what the session touched, not the complete set.\n",
+    );
+  }
+
+  function fence(text: string): string {
+    const match = text.match(/`+/g);
+    const maxTicks = match ? Math.max(...match.map((m) => m.length)) : 0;
+    const ticks = "`".repeat(Math.max(3, maxTicks + 1));
+    return `${ticks}\n${text}\n${ticks}`;
+  }
+
+  lines.push("## Trajectory Timeline\n");
+  for (const e of events) {
+    const p = payload(e);
+    if (e.type === "message.user") {
+      const text = str(p.text) ?? "";
+      lines.push(`### User (seq ${e.seq})\n`);
+      lines.push(fence(text) + "\n");
+    } else if (e.type === "message.assistant") {
+      const { text, thinking } = assistantText(e);
+      lines.push(`### Assistant (seq ${e.seq})\n`);
+      if (thinking) {
+        lines.push(`Thinking:\n\n${fence(thinking)}\n`);
+      }
+      if (text) {
+        lines.push(fence(text) + "\n");
+      }
+    } else if (e.type === "tool.call") {
+      const name = str(p.name) ?? "tool";
+      lines.push(`- **Tool Call** \`${name}\` (seq ${e.seq})`);
+    } else if (e.type === "tool.result") {
+      const isErr = p.isError === true;
+      lines.push(`  - Result: ${isErr ? "❌ Error" : "✓ OK"}`);
+    }
+  }
+
+  return lines.join("\n") + "\n";
+}
